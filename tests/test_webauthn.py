@@ -111,6 +111,29 @@ class TestWebAuthnDataTypes(unittest.TestCase):
         )
         assert o.cross_origin is True
 
+    def test_collected_client_data_top_origin(self):
+        o = CollectedClientData(
+            b'{"type":"webauthn.get","challenge":"AA","origin":"https://embed.example",'
+            b'"crossOrigin":true,"topOrigin":"https://portal.example"}'
+        )
+        assert o.cross_origin is True
+        assert o.top_origin == "https://portal.example"
+
+        created = CollectedClientData.create(
+            "webauthn.get",
+            "AA",
+            "https://embed.example",
+            cross_origin=True,
+            top_origin="https://portal.example",
+        )
+        assert created.top_origin == "https://portal.example"
+        assert b'"topOrigin":"https://portal.example"' in bytes(created)
+
+        # topOrigin is omitted (not serialized as null) when not provided.
+        plain = CollectedClientData.create("webauthn.get", "AA", "https://example.com")
+        assert plain.top_origin is None
+        assert b"topOrigin" not in bytes(plain)
+
     def test_authenticator_selection_criteria(self):
         o = AuthenticatorSelectionCriteria(
             authenticator_attachment="platform",

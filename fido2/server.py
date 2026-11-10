@@ -122,6 +122,33 @@ def _ignore_attestation(
     """Ignore attestation."""
 
 
+def _validate_cross_origin_policy(
+    cross_origin: bool, top_origins: Sequence[str] | None
+) -> tuple[bool, frozenset[str]]:
+    """Validate a cross-origin policy supplied when beginning a credential
+    operation, normalizing it into the values stored in the internal state.
+
+    Only actual booleans are accepted for cross_origin: a string such as
+    "false" is not coerced, so it can never silently enable or disable the
+    cross-origin behavior. When cross-origin use is allowed, the caller must
+    name at least one trusted top-level origin. The set is built exclusively
+    from this caller-supplied data; values seen in a response never extend it.
+    """
+    if not isinstance(cross_origin, bool):
+        raise TypeError("cross_origin must be a boolean.")
+
+    allowed_top_origins = frozenset(top_origins or ())
+    if cross_origin and not allowed_top_origins:
+        raise ValueError(
+            "Cross-origin credential operations require at least one trusted "
+            "top_origin."
+        )
+    if not all(isinstance(o, str) for o in allowed_top_origins):
+        raise TypeError("top_origins must contain only origin strings.")
+
+    return cross_origin, allowed_top_origins
+
+
 class Fido2Server:
     """FIDO2 server.
 
@@ -132,6 +159,15 @@ class Fido2Server:
         invoked with attestation_object and client_data_hash. It should return nothing
         and raise an exception on failure. By default, attestation is ignored.
         Attestation is also ignored if `attestation` is set to `none`.
+
+    Cross-origin (embedded) credential operations are disabled by default. To allow
+    a registration or authentication initiated from a page embedded in a trusted
+    partner site, pass ``cross_origin=True`` together with the set of trusted
+    ``top_origins`` to the corresponding ``register_begin``/``authenticate_begin``
+    call. The policy is stored in the returned state and enforced on completion
+    following the WebAuthn Level 3 origin checks: ``origin`` and ``topOrigin`` are
+    verified separately, and only top-level origins supplied by the caller are
+    trusted.
     """
 
     def __init__(
@@ -166,6 +202,8 @@ class Fido2Server:
         authenticator_attachment: AuthenticatorAttachment | None = None,
         challenge: bytes | None = None,
         extensions=None,
+        cross_origin: bool = False,
+        top_origins: Sequence[str] | None = None,
     ) -> tuple[CredentialCreationOptions, Any]:
         """Return a PublicKeyCredentialCreationOptions registration object and
         the internal state dictionary that needs to be passed as is to the
@@ -180,13 +218,20 @@ class Fido2Server:
             or None to not provide a preference (and get both types).
         :param challenge: A custom challenge to sign and verify or None to use
             OS-specific random bytes.
+        :param cross_origin: If True, permit this registration to run inside a
+            cross-origin (embedded) page, per WebAuthn Level 3. Defaults to False,
+            meaning only same-origin registrations are accepted.
+        :param top_origins: Required when cross_origin is True. The set of trusted
+            top-level origins allowed to embed the page for this registration.
         :return: Registration data, internal state."""
         if not self.allowed_algorithms:
             raise ValueError("Server has no allowed algorithms.")
 
         challenge = _validata_challenge(challenge)
         descriptors = _wrap_credentials(credentials)
-        state = self._make_internal_state(challenge, user_verification)
+        state = self._make_internal_state(
+            challenge, user_verification, cross_origin, top_origins
+        )
         logger.debug(
             "Starting new registration, existing credentials: "
             + ", ".join(d.id.hex() for d in descriptors or [])
@@ -242,8 +287,7 @@ class Fido2Server:
 
         if client_data.type != CollectedClientData.TYPE.CREATE:
             raise ValueError("Incorrect type in CollectedClientData.")
-        if not self._verify(client_data.origin):
-            raise ValueError("Invalid origin in CollectedClientData.")
+        self._verify_client_data_origin(client_data, state)
         if not constant_time.bytes_eq(
             websafe_decode(state["challenge"]), client_data.challenge
         ):
@@ -285,6 +329,8 @@ class Fido2Server:
         user_verification: UserVerificationRequirement | None = None,
         challenge: bytes | None = None,
         extensions=None,
+        cross_origin: bool = False,
+        top_origins: Sequence[str] | None = None,
     ) -> tuple[CredentialRequestOptions, Any]:
         """Return a PublicKeyCredentialRequestOptions assertion object and the internal
         state dictionary that needs to be passed as is to the corresponding
@@ -295,10 +341,17 @@ class Fido2Server:
         :param user_verification: The desired USER_VERIFICATION level.
         :param challenge: A custom challenge to sign and verify or None to use
             OS-specific random bytes.
+        :param cross_origin: If True, permit this authentication to run inside a
+            cross-origin (embedded) page, per WebAuthn Level 3. Defaults to False,
+            meaning only same-origin authentications are accepted.
+        :param top_origins: Required when cross_origin is True. The set of trusted
+            top-level origins allowed to embed the page for this authentication.
         :return: Assertion data, internal state."""
         challenge = _validata_challenge(challenge)
         descriptors = _wrap_credentials(credentials)
-        state = self._make_internal_state(challenge, user_verification)
+        state = self._make_internal_state(
+            challenge, user_verification, cross_origin, top_origins
+        )
         if descriptors is None:
             logger.debug("Starting new authentication without credentials")
         else:
@@ -346,8 +399,7 @@ class Fido2Server:
 
         if client_data.type != CollectedClientData.TYPE.GET:
             raise ValueError("Incorrect type in CollectedClientData.")
-        if not self._verify(client_data.origin):
-            raise ValueError("Invalid origin in CollectedClientData.")
+        self._verify_client_data_origin(client_data, state)
         if not constant_time.bytes_eq(
             websafe_decode(state["challenge"]), client_data.challenge
         ):
@@ -377,9 +429,71 @@ class Fido2Server:
 
     @staticmethod
     def _make_internal_state(
-        challenge: bytes, user_verification: UserVerificationRequirement | None
+        challenge: bytes,
+        user_verification: UserVerificationRequirement | None,
+        cross_origin: bool = False,
+        top_origins: Sequence[str] | None = None,
     ):
+        cross_origin, allowed_top_origins = _validate_cross_origin_policy(
+            cross_origin, top_origins
+        )
         return {
             "challenge": websafe_encode(challenge),
             "user_verification": user_verification,
+            "cross_origin": cross_origin,
+            "top_origins": allowed_top_origins,
         }
+
+    def _verify_client_data_origin(
+        self, client_data: CollectedClientData, state: Mapping[str, Any]
+    ) -> None:
+        """Validate the origin-related fields of CollectedClientData against the
+        cross-origin policy stored in the state for this operation.
+
+        Implements the origin checks of WebAuthn Level 3, section 7.2.9. The
+        origin and top-level origin are checked independently: allowing one
+        never implicitly allows the other. The trusted top-level origins come
+        solely from the policy captured at begin time; values present in a
+        response are never used to extend the allowlist.
+
+        States produced by older library versions lack the policy fields. They
+        are treated as same-origin-only, so a cross-origin response can never
+        be accepted merely because the fields are missing.
+        """
+        # The client-side crossOrigin flag must be a real boolean. A string such
+        # as "false" must not be coerced to a truthy/falsy value.
+        response_cross_origin = client_data.cross_origin
+        if not isinstance(response_cross_origin, bool):
+            raise ValueError(
+                "Invalid crossOrigin in CollectedClientData: must be a boolean."
+            )
+
+        # Backward-compatible default: states without an explicit policy are
+        # same-origin-only.
+        allow_cross_origin = state.get("cross_origin", False)
+        allowed_top_origins = frozenset(state.get("top_origins", ()))
+
+        # Step 1: the effective (embedded) origin is always checked against the
+        # RP, regardless of whether the operation is cross-origin.
+        if not self._verify(client_data.origin):
+            raise ValueError("Invalid origin in CollectedClientData.")
+
+        # Step 2: a cross-origin response is only acceptable if this operation
+        # was explicitly started with a cross-origin policy.
+        if response_cross_origin and not allow_cross_origin:
+            raise ValueError(
+                "Cross-origin credential operation is not permitted for this "
+                "request."
+            )
+        if not response_cross_origin:
+            return
+
+        # Step 3 (cross-origin only): the top-level origin must be present and
+        # must be one of the trusted origins supplied at begin time.
+        top_origin = client_data.top_origin
+        if not isinstance(top_origin, str):
+            raise ValueError(
+                "Cross-origin CollectedClientData must include a topOrigin."
+            )
+        if top_origin not in allowed_top_origins:
+            raise ValueError("Invalid topOrigin in CollectedClientData.")

@@ -1,4 +1,11 @@
 * Version 2.2.2 (unreleased)
+ ** Server: Add an explicit cross-origin (embedded page) policy to
+    register_begin/authenticate_begin. Cross-origin operations are disabled by
+    default and are enabled per operation with cross_origin=True plus a trusted
+    top_origins set. The origin and topOrigin of CollectedClientData are checked
+    separately following WebAuthn Level 3; crossOrigin must be a real boolean and
+    response values never extend the caller-provided allowlist. States produced
+    by older versions remain same-origin-only. See examples/cross_origin_policy.py.
  ** Attestation: Use cryptography's certificate issuer verification when available,
     supporting additional signature algorithms while retaining the legacy fallback.
  ** MDS: Allow omitted userVerificationDetails and attachmentHint fields, as
