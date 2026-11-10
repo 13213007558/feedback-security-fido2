@@ -83,10 +83,13 @@ results = client.get_assertion(request_options["publicKey"])
 # Only one cred in allowCredentials, only one response.
 result = results.get_response(0)
 
-# Complete authenticator
-server.authenticate_complete(state, credentials, result)
+# Complete authenticator. The credential IDs sent in allowCredentials were pinned
+# in the state by authenticate_begin, so only those credentials can authenticate;
+# passing extra entries in `credentials` here cannot widen the scope.
+auth_result = server.authenticate_complete(state, credentials, result)
 
 print("Credential authenticated!")
+print("Authenticated credential ID:", auth_result.credential.credential_id.hex())
 response = result.response
 
 print("CLIENT DATA:", response.client_data)

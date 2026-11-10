@@ -96,6 +96,9 @@ def authenticate_begin():
         abort(404)
 
     options, state = server.authenticate_begin(credentials)
+    # The state now pins the allowed credential IDs for this ceremony. Storing it
+    # in the session is what fixes the scope: the IDs cannot be widened later by
+    # changing the `credentials` list or by sending additional candidates.
     session["state"] = state
 
     return jsonify(dict(options))
@@ -108,6 +111,7 @@ def authenticate_complete():
 
     response = request.json
     print("AuthenticationResponse:", response)
+    # Only credentials whose IDs were pinned in the stored state can succeed.
     server.authenticate_complete(
         session.pop("state"),
         credentials,

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 from cryptography.exceptions import InvalidSignature as _InvalidSignature
@@ -65,6 +66,21 @@ logger = logging.getLogger(__name__)
 
 VerifyAttestation = Callable[[AttestationObject, bytes], None]
 VerifyOrigin = Callable[[str], bool]
+
+
+@dataclass(frozen=True)
+class AuthenticationResult:
+    """The result of a successfully verified authentication.
+
+    :param credential: The registered credential that was used to authenticate.
+    :param user_handle: The user handle (user id) that the assertion belongs to,
+        or None if no user association could be established. For a discoverable
+        credential authentication this is always resolved from the assertion and
+        trusted server-side data.
+    """
+
+    credential: AttestedCredentialData
+    user_handle: bytes | None = None
 
 
 def _verify_origin_for_rp(rp_id: str) -> VerifyOrigin:
@@ -299,6 +315,20 @@ class Fido2Server:
         challenge = _validata_challenge(challenge)
         descriptors = _wrap_credentials(credentials)
         state = self._make_internal_state(challenge, user_verification)
+        # Pin the credential IDs that are actually allowed for this authentication.
+        # The values are encoded so that the state stays JSON serializable (it is
+        # commonly stored in a browser session). authenticate_complete only ever
+        # trusts the IDs captured here, never the credentials passed to it, so a
+        # caller that mutates the original list or supplies additional credentials
+        # at completion time cannot widen the scope of the authentication.
+        if descriptors:
+            state["allow_credentials"] = tuple(
+                websafe_encode(d.id) for d in descriptors
+            )
+        else:
+            # No allowCredentials: discoverable credential flow, whose user
+            # association must be supplied and verified at completion time.
+            state["allow_credentials"] = None
         if descriptors is None:
             logger.debug("Starting new authentication without credentials")
         else:
@@ -326,23 +356,46 @@ class Fido2Server:
         state,
         credentials: Sequence[AttestedCredentialData],
         response: AuthenticationResponse | Mapping[str, Any],
-    ) -> AttestedCredentialData:
+        expected_user_handle: bytes | None = None,
+        credential_users: Mapping[bytes, bytes] | None = None,
+    ) -> AuthenticationResult:
         """Verify the correctness of the assertion data received from
         the client.
 
+        The set of credentials that may authenticate is fixed by the corresponding
+        `authenticate_begin` call, not by the `credentials` argument here:
+
+        * When `authenticate_begin` was given `allowCredentials`, their IDs were
+          pinned in the state. Only a credential whose ID is part of that pinned set
+          can succeed, no matter how many extra entries `credentials` contains.
+        * When `authenticate_begin` was called without credentials (a discoverable
+          credential flow), the caller must identify the expected user by passing
+          either `expected_user_handle` or a trusted `credential_users` mapping of
+          credential ID to user handle. The assertion's `userHandle` must then be
+          present and consistent with the selected credential's ownership.
+
         :param state: The state data returned by the corresponding
-            `register_begin`.
-        :param credentials: The list of previously registered credentials.
-        :param credential_id: The credential id from the client response.
-        :param client_data: The client data.
-        :param auth_data: The authenticator data.
-        :param signature: The signature provided by the client."""
+            `authenticate_begin`.
+        :param credentials: The server's registered credentials. These are used as
+            candidates to verify the signature, but cannot expand the scope pinned
+            in `state`.
+        :param response: The authentication response from the client.
+        :param expected_user_handle: The user handle (user id) the server expects
+            the assertion to belong to. Required for a discoverable credential flow
+            unless `credential_users` is given.
+        :param credential_users: A trusted mapping of credential ID to the user
+            handle that owns the credential. Used to resolve the user for a
+            discoverable credential flow, and may be supplied for an allowCredentials
+            flow to confirm the returned user association.
+        :return: The authenticated credential together with its resolved user handle.
+        """
 
         authentication = AuthenticationResponse.from_dict(response)
         credential_id = authentication.raw_id
         client_data = authentication.response.client_data
         auth_data = authentication.response.authenticator_data
         signature = authentication.response.signature
+        response_user_handle = authentication.response.user_handle
 
         if client_data.type != CollectedClientData.TYPE.GET:
             raise ValueError("Incorrect type in CollectedClientData.")
@@ -365,15 +418,98 @@ class Fido2Server:
                 "User verification required, but user verified flag not set."
             )
 
-        for cred in credentials:
-            if cred.credential_id == credential_id:
-                try:
-                    cred.public_key.verify(auth_data + client_data.hash, signature)
-                except _InvalidSignature:
-                    raise ValueError("Invalid signature.")
-                logger.info(f"Credential authenticated: {credential_id.hex()}")
-                return cred
-        raise ValueError("Unknown credential ID.")
+        allow_credentials = state.get("allow_credentials")
+        discoverable = allow_credentials is None
+
+        # A discoverable flow has no server-pinned scope, so the caller must supply
+        # the trusted information needed to bind the assertion to a user.
+        if discoverable and (expected_user_handle is None and credential_users is None):
+            raise ValueError(
+                "Discoverable credential authentication requires either an "
+                "expected_user_handle or a credential_users mapping."
+            )
+
+        # The two supplied ownership sources must not disagree about the user.
+        owner_from_mapping = None
+        if credential_users is not None:
+            owner_from_mapping = credential_users.get(credential_id)
+            if discoverable and owner_from_mapping is None:
+                raise ValueError("Credential is not associated with a known user.")
+        if (
+            expected_user_handle is not None
+            and owner_from_mapping is not None
+            and not constant_time.bytes_eq(expected_user_handle, owner_from_mapping)
+        ):
+            raise ValueError(
+                "Ambiguous credential configuration: expected_user_handle does not "
+                "match the owner in credential_users."
+            )
+
+        # Enforce the scope pinned at authenticate_begin before touching any
+        # candidate public key, so a valid signature from an out-of-scope credential
+        # can never authenticate.
+        if not discoverable:
+            allowed = set(allow_credentials)
+            if websafe_encode(credential_id) not in allowed:
+                raise ValueError(
+                    "Credential ID is not part of the credentials allowed for this "
+                    "authentication."
+                )
+
+        # Collect every registered candidate sharing the asserted ID. Matching by ID
+        # and rejecting conflicting definitions means the result never depends on
+        # the ordering of the input list.
+        candidates = [
+            cred for cred in credentials if cred.credential_id == credential_id
+        ]
+        if not candidates:
+            raise ValueError("Unknown credential ID.")
+
+        reference_public_key = candidates[0].public_key
+        for cred in candidates[1:]:
+            if cred.public_key != reference_public_key:
+                raise ValueError(
+                    "Ambiguous credential configuration: the same credential ID is "
+                    "registered with conflicting public keys."
+                )
+        selected = candidates[0]
+
+        # Resolve and verify the user association. For a discoverable flow the
+        # authenticator must return a userHandle, and it has to agree with both the
+        # trusted owner (when known) and the expected user handle. These checks keep
+        # a missing handle, an empty handle and a mismatched handle distinct.
+        user_handle: bytes | None
+        if discoverable:
+            if response_user_handle is None:
+                raise ValueError(
+                    "Missing user handle in discoverable credential response."
+                )
+            if expected_user_handle is not None and not constant_time.bytes_eq(
+                response_user_handle, expected_user_handle
+            ):
+                raise ValueError("userHandle does not match the expected user.")
+            if owner_from_mapping is not None and not constant_time.bytes_eq(
+                response_user_handle, owner_from_mapping
+            ):
+                raise ValueError("userHandle does not match the credential's owner.")
+            user_handle = response_user_handle
+        else:
+            if owner_from_mapping is not None:
+                user_handle = owner_from_mapping
+            elif expected_user_handle is not None:
+                user_handle = expected_user_handle
+            else:
+                user_handle = response_user_handle
+
+        # Only verify the signature once the credential is known to be in scope and
+        # unambiguously configured.
+        try:
+            selected.public_key.verify(auth_data + client_data.hash, signature)
+        except _InvalidSignature:
+            raise ValueError("Invalid signature.")
+
+        logger.info(f"Credential authenticated: {credential_id.hex()}")
+        return AuthenticationResult(selected, user_handle)
 
     @staticmethod
     def _make_internal_state(

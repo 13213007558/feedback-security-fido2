@@ -95,10 +95,15 @@ selection = client.get_assertion(request_options["publicKey"])
 result = selection.get_response(0)  # There may be multiple responses, get the first.
 
 
-# Complete authenticator
-server.authenticate_complete(state, credentials, result)
+# Complete authenticator. This is a discoverable credential flow (no
+# allowCredentials were sent), so the server pins the expected user itself: the
+# assertion's userHandle must match the user the credential was created for.
+auth_result = server.authenticate_complete(
+    state, credentials, result, expected_user_handle=user["id"]
+)
 
 print("Credential authenticated!")
+print("Authenticated user handle:", auth_result.user_handle)
 response = result.response
 
 print("USER ID:", response.user_handle)

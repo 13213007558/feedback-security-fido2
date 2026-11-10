@@ -91,7 +91,14 @@ def test_exclude_credentials_others(client):
 def test_allow_credentials_empty(discoverable_credential, client):
     request_options, state = server.authenticate_begin()
     result = client.get_assertion(request_options.public_key).get_response(0)
-    server.authenticate_complete(state, [discoverable_credential], result)
+    # No allowCredentials: pin the expected user handle so the server can bind the
+    # discoverable assertion to the user the credential was created for.
+    server.authenticate_complete(
+        state,
+        [discoverable_credential],
+        result,
+        expected_user_handle=user["id"],
+    )
 
 
 def test_allow_credentials_single(credential, client):
