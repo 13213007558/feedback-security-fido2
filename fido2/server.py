@@ -34,7 +34,23 @@ from typing import Any, Callable, Mapping, Sequence
 from cryptography.exceptions import InvalidSignature as _InvalidSignature
 from cryptography.hazmat.primitives import constant_time
 
-from .cose import CoseKey
+from . import cose
+from .cose import (
+    CoseKey,
+    Ed448,
+    Ed25519,
+    EdDSA,
+    ES256,
+    ES256K,
+    ES384,
+    ES512,
+    ESP256,
+    ESP384,
+    ESP512,
+    PS256,
+    RS1,
+    RS256,
+)
 from .rpid import verify_rp_id
 from .utils import websafe_decode, websafe_encode
 from .webauthn import (
@@ -122,6 +138,65 @@ def _ignore_attestation(
     """Ignore attestation."""
 
 
+# Structural requirements for a credential public key, by COSE algorithm.
+# Each entry maps an algorithm identifier to a tuple of:
+#   (kty, crv or None, required public key params, forbidden private key params)
+_EC_PRIVATE_PARAMS = frozenset({-4})  # EC2/OKP private key "d"
+_RSA_PRIVATE_PARAMS = frozenset({-3, -4, -5, -6, -7, -8, -9, -10, -11, -12})
+_AKP_PRIVATE_PARAMS = frozenset({-2})  # ML-DSA private seed
+
+_CREDENTIAL_KEY_SPECS: Mapping[int, tuple[int, int | None, frozenset, frozenset]] = {
+    ES256.ALGORITHM: (2, 1, frozenset({-2, -3}), _EC_PRIVATE_PARAMS),
+    ESP256.ALGORITHM: (2, 1, frozenset({-2, -3}), _EC_PRIVATE_PARAMS),
+    ES384.ALGORITHM: (2, 2, frozenset({-2, -3}), _EC_PRIVATE_PARAMS),
+    ESP384.ALGORITHM: (2, 2, frozenset({-2, -3}), _EC_PRIVATE_PARAMS),
+    ES512.ALGORITHM: (2, 3, frozenset({-2, -3}), _EC_PRIVATE_PARAMS),
+    ESP512.ALGORITHM: (2, 3, frozenset({-2, -3}), _EC_PRIVATE_PARAMS),
+    ES256K.ALGORITHM: (2, 8, frozenset({-2, -3}), _EC_PRIVATE_PARAMS),
+    EdDSA.ALGORITHM: (1, 6, frozenset({-2}), _EC_PRIVATE_PARAMS),
+    Ed25519.ALGORITHM: (1, 6, frozenset({-2}), _EC_PRIVATE_PARAMS),
+    Ed448.ALGORITHM: (1, 7, frozenset({-2}), _EC_PRIVATE_PARAMS),
+    RS256.ALGORITHM: (3, None, frozenset({-1, -2}), _RSA_PRIVATE_PARAMS),
+    PS256.ALGORITHM: (3, None, frozenset({-1, -2}), _RSA_PRIVATE_PARAMS),
+    RS1.ALGORITHM: (3, None, frozenset({-1, -2}), _RSA_PRIVATE_PARAMS),
+}
+if cose._mldsa:
+    _CREDENTIAL_KEY_SPECS.update(
+        {
+            cose.MLDSA44.ALGORITHM: (7, None, frozenset({-1}), _AKP_PRIVATE_PARAMS),
+            cose.MLDSA65.ALGORITHM: (7, None, frozenset({-1}), _AKP_PRIVATE_PARAMS),
+            cose.MLDSA87.ALGORITHM: (7, None, frozenset({-1}), _AKP_PRIVATE_PARAMS),
+        }
+    )
+
+
+def _verify_credential_algorithm(
+    public_key: CoseKey, allowed_algorithms: Sequence[int]
+) -> None:
+    """Verify that a credential public key matches one of the algorithms that
+    was offered to the client in the corresponding `register_begin` call.
+
+    :param public_key: The COSE public key of the credential.
+    :param allowed_algorithms: The COSE algorithm identifiers that were pinned
+        to the registration state by `register_begin`.
+    """
+    alg = public_key.get(3)
+    if alg not in allowed_algorithms:
+        raise ValueError(f"Credential public key algorithm not allowed: {alg}.")
+    spec = _CREDENTIAL_KEY_SPECS.get(alg)
+    if spec is None:
+        raise ValueError(f"Unsupported credential public key algorithm: {alg}.")
+    kty, crv, required, private = spec
+    if public_key.get(1) != kty:
+        raise ValueError("Credential public key type does not match its algorithm.")
+    if crv is not None and public_key.get(-1) != crv:
+        raise ValueError("Credential public key curve does not match its algorithm.")
+    if any(p not in public_key for p in required):
+        raise ValueError("Credential public key is missing required parameters.")
+    if any(p in public_key for p in private):
+        raise ValueError("Credential public key contains private key parameters.")
+
+
 class Fido2Server:
     """FIDO2 server.
 
@@ -181,12 +256,18 @@ class Fido2Server:
         :param challenge: A custom challenge to sign and verify or None to use
             OS-specific random bytes.
         :return: Registration data, internal state."""
-        if not self.allowed_algorithms:
+        allowed_algorithms = [
+            PublicKeyCredentialParameters.from_dict(p) for p in self.allowed_algorithms
+        ]
+        if not allowed_algorithms:
             raise ValueError("Server has no allowed algorithms.")
 
         challenge = _validata_challenge(challenge)
         descriptors = _wrap_credentials(credentials)
         state = self._make_internal_state(challenge, user_verification)
+        # Pin the negotiated algorithms to the state so that later changes to
+        # the server configuration cannot alter this registration.
+        state["allowed_algorithms"] = [p.alg for p in allowed_algorithms]
         logger.debug(
             "Starting new registration, existing credentials: "
             + ", ".join(d.id.hex() for d in descriptors or [])
@@ -198,7 +279,7 @@ class Fido2Server:
                     rp=self.rp,
                     user=PublicKeyCredentialUserEntity.from_dict(user),
                     challenge=challenge,
-                    pub_key_cred_params=self.allowed_algorithms,
+                    pub_key_cred_params=allowed_algorithms,
                     timeout=self.timeout,
                     exclude_credentials=descriptors,
                     authenticator_selection=(
@@ -271,6 +352,24 @@ class Fido2Server:
 
         auth_data = attestation_object.auth_data
         assert auth_data.credential_data is not None  # noqa: S101
+
+        # Verify the credential public key against the algorithms offered in
+        # register_begin. This applies to the credential key itself, not to
+        # the attestation signature, and is enforced for all attestation types.
+        allowed_algorithms = state.get("allowed_algorithms")
+        if allowed_algorithms is None:
+            # State created before algorithm negotiation was recorded: skip
+            # the check explicitly rather than silently applying the current
+            # server configuration to a registration it did not issue.
+            logger.warning(
+                "Registration state has no allowed_algorithms; "
+                "skipping credential algorithm verification."
+            )
+        else:
+            _verify_credential_algorithm(
+                auth_data.credential_data.public_key, allowed_algorithms
+            )
+
         logger.info(
             "New credential registered: "
             + auth_data.credential_data.credential_id.hex()
