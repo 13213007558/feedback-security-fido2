@@ -42,6 +42,7 @@ from cryptography.hazmat.backends import default_backend
 from .attestation import (
     Attestation,
     AttestationVerifier,
+    InvalidAttestation,
     UntrustedAttestation,
     verify_x509_chain,
 )
@@ -463,18 +464,25 @@ class MdsAttestationVerifier(AttestationVerifier):
                 )
                 return None
 
-            issuer = x509.load_der_x509_certificate(
-                attestation_result.trust_path[-1], default_backend()
-            ).issuer
-
+            # Only the roots listed for the matched entry may be used to build
+            # the chain. A matching subject name is not, by itself, evidence of
+            # trust: try each candidate root and accept the first one which
+            # actually verifies the chain (issuer name and signatures).
             for root in entry.metadata_statement.attestation_root_certificates:
-                subject = x509.load_der_x509_certificate(
-                    root, default_backend()
-                ).subject
-                if subject == issuer:
-                    _last_entry.set(entry)
-                    return root
-            logger.info(f"No attestation root matching subject: {issuer}")
+                try:
+                    verify_x509_chain(list(attestation_result.trust_path) + [root])
+                except InvalidAttestation:
+                    logger.debug(
+                        "Attestation root candidate failed to verify the chain, "
+                        "trying next candidate"
+                    )
+                    continue
+                _last_entry.set(entry)
+                return root
+            logger.info(
+                "None of the attestation root candidates for the matched "
+                "metadata entry could verify the chain"
+            )
         return None
 
     def find_entry(

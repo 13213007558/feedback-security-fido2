@@ -32,6 +32,7 @@ from .base import (  # noqa: F401
     AttestationResult,
     AttestationType,
     AttestationVerifier,
+    InvalidAttestation,
     InvalidData,
     InvalidSignature,
     NoneAttestation,

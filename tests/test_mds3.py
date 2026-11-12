@@ -1,15 +1,32 @@
 import json
 from base64 import b64decode
+from datetime import date, datetime, timedelta
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
+from fido2.attestation import UntrustedAttestation
+from fido2.cose import ES256
 from fido2.mds3 import (
+    AuthenticatorStatus,
     MdsAttestationVerifier,
+    MetadataBlobPayload,
+    MetadataBlobPayloadEntry,
     MetadataStatement,
+    StatusReport,
     VerificationMethodDescriptor,
     parse_blob,
 )
 from fido2.utils import websafe_decode
+from fido2.webauthn import (
+    Aaguid,
+    AttestedCredentialData,
+    AttestationObject,
+    AuthenticatorData,
+)
 
 # Example data from:
 # https://fidoalliance.org/specs/mds/fido-metadata-service-v3.0-ps-20210518.html#examples
@@ -355,3 +372,363 @@ def test_lookup_filter_does_not_affect_find_entry_by_aaguid():
         data, attestation_filter=lambda e, _: e.aaguid != AAGUID
     )
     assert mds.find_entry_by_aaguid(AAGUID)
+
+
+# --- Helpers for building synthetic attestations and metadata --------------
+
+TEST_AAGUID = Aaguid(bytes.fromhex("11111111222233334444555566667777"))
+CA_NAME = x509.Name(
+    [
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "SE"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Test Org"),
+        x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Test Unit"),
+        x509.NameAttribute(NameOID.COMMON_NAME, "Rotating Attestation Root"),
+    ]
+)
+_NOT_BEFORE = datetime(2026, 1, 1)
+_NOT_AFTER = _NOT_BEFORE + timedelta(days=365)
+
+
+def _der(cert):
+    return cert.public_bytes(serialization.Encoding.DER)
+
+
+def _make_root(name=CA_NAME):
+    """Create a self-signed root CA with a fresh key."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_NOT_BEFORE)
+        .not_valid_after(_NOT_AFTER)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    return key, _der(cert)
+
+
+def _sign_cert(public_key, subject, issuer_key, issuer_name, *, ca=False, serial=None):
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer_name)
+        .public_key(public_key)
+        .serial_number(serial or x509.random_serial_number())
+        .not_valid_before(_NOT_BEFORE)
+        .not_valid_after(_NOT_AFTER)
+        .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+    )
+    return _der(builder.sign(issuer_key, hashes.SHA256()))
+
+
+def _make_packed_attestation(issuer_key, issuer_name, intermediates=()):
+    """Build a valid packed attestation signed by a fresh key.
+
+    Returns the AttestationObject and the DER encoded leaf certificate.
+    """
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    leaf_subject = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "SE"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Test Org"),
+            x509.NameAttribute(
+                NameOID.ORGANIZATIONAL_UNIT_NAME, "Authenticator Attestation"
+            ),
+            x509.NameAttribute(NameOID.COMMON_NAME, "Test Authenticator"),
+        ]
+    )
+    leaf = _sign_cert(leaf_key.public_key(), leaf_subject, issuer_key, issuer_name)
+
+    credential_data = AttestedCredentialData.create(
+        TEST_AAGUID, b"credential-id", ES256.from_cryptography_key(leaf_key.public_key())
+    )
+    auth_data = AuthenticatorData.create(
+        b"\x00" * 32,
+        AuthenticatorData.FLAG.UP | AuthenticatorData.FLAG.AT,
+        0,
+        credential_data,
+    )
+    client_data_hash = b"\x01" * 32
+    sig = leaf_key.sign(
+        auth_data + client_data_hash, ec.ECDSA(hashes.SHA256())
+    )
+
+    x5c = [leaf, *intermediates]
+    attestation = AttestationObject.create(
+        "packed", auth_data, {"alg": -7, "sig": sig, "x5c": x5c}
+    )
+    return attestation, client_data_hash, leaf
+
+
+def _make_statement(roots):
+    return MetadataStatement(
+        description="Test Authenticator",
+        authenticator_version=1,
+        schema=3,
+        upv=[{"major": 1, "minor": 0}],
+        attestation_types=["basic_full"],
+        key_protection=["hardware"],
+        matcher_protection=["on_chip"],
+        tc_display=["any"],
+        attestation_root_certificates=roots,
+        aaguid=TEST_AAGUID,
+    )
+
+
+def _make_entry(roots, status_reports=None):
+    return MetadataBlobPayloadEntry(
+        status_reports=status_reports
+        or [StatusReport(AuthenticatorStatus.FIDO_CERTIFIED, date(2026, 1, 1))],
+        time_of_last_status_change=date(2026, 1, 1),
+        aaguid=TEST_AAGUID,
+        metadata_statement=_make_statement(roots),
+    )
+
+
+def _make_blob(entries):
+    return MetadataBlobPayload(
+        legal_header="test",
+        no=1,
+        next_update=date(2030, 1, 1),
+        entries=entries,
+    )
+
+
+def _fingerprint(der):
+    return x509.load_der_x509_certificate(der).fingerprint(hashes.SHA256()).hex()
+
+
+def test_root_selection_verifies_chain_not_subject():
+    """Two roots share a subject, but only one key actually signed the chain.
+
+    Ordering of the candidate roots must not affect which root is selected.
+    """
+    old_key, old_root = _make_root()  # Rotated-out root (same subject, new key)
+    new_key, new_root = _make_root()
+    assert x509.load_der_x509_certificate(old_root).subject == (
+        x509.load_der_x509_certificate(new_root).subject
+    )
+    assert old_root != new_root
+
+    attestation, client_data_hash, _ = _make_packed_attestation(
+        new_key, CA_NAME
+    )
+
+    for roots in ([old_root, new_root], [new_root, old_root]):
+        mds = MdsAttestationVerifier(_make_blob([_make_entry(roots)]))
+        entry = mds.find_entry(attestation, client_data_hash)
+        assert entry is not None
+        assert entry.aaguid == TEST_AAGUID
+        # The successful root is always the one whose key verifies the chain,
+        # regardless of how the candidates are ordered.
+        selected = mds.ca_lookup(
+            type("R", (), {"trust_path": attestation.att_stmt["x5c"]})(),
+            attestation.auth_data,
+        )
+        assert selected == new_root
+        assert _fingerprint(selected) == _fingerprint(new_root)
+
+
+def test_root_selection_returns_matching_entry():
+    """find_entry returns the entry belonging to the chain that verified."""
+    new_key, new_root = _make_root()
+    other_key, other_root = _make_root()
+    attestation, client_data_hash, _ = _make_packed_attestation(
+        new_key, CA_NAME
+    )
+
+    own_entry = _make_entry([new_root])
+    other_entry = MetadataBlobPayloadEntry(
+        status_reports=[
+            StatusReport(AuthenticatorStatus.FIDO_CERTIFIED, date(2026, 1, 1))
+        ],
+        time_of_last_status_change=date(2026, 1, 1),
+        aaguid=Aaguid(bytes.fromhex("aaaaaaaaaaaabbbbbbbbbbbbcccccccc")),
+        metadata_statement=_make_statement([other_root]),
+    )
+    mds = MdsAttestationVerifier(_make_blob([own_entry, other_entry]))
+    assert mds.find_entry(attestation, client_data_hash) is own_entry
+
+
+def test_no_matching_root_is_untrusted():
+    """A same-subject root with the wrong key must not be accepted."""
+    old_key, old_root = _make_root()
+    attestation, client_data_hash, _ = _make_packed_attestation(
+        old_key, CA_NAME
+    )
+    # The entry only holds an unrelated root (different key).
+    _, foreign_root = _make_root()
+    mds = MdsAttestationVerifier(_make_blob([_make_entry([foreign_root])]))
+
+    assert mds.find_entry(attestation, client_data_hash) is None
+    with pytest.raises(UntrustedAttestation):
+        mds.verify_attestation(attestation, client_data_hash)
+
+
+def test_invalid_intermediate_fails_then_other_root_succeeds():
+    """A broken intermediate rejects one root; a later candidate still works."""
+    first_key, first_root = _make_root()
+    second_key, second_root = _make_root()
+
+    # Intermediate signed by the second root, but pretending to be issued by
+    # the first (issuer name matches the shared subject while the signature does
+    # not verify against the first root's key).
+    int_key = ec.generate_private_key(ec.SECP256R1())
+    int_subject = x509.Name(
+        [x509.NameAttribute(NameOID.COMMON_NAME, "Test Intermediate")]
+    )
+    good_intermediate = _sign_cert(
+        int_key.public_key(), int_subject, second_key, CA_NAME, ca=True
+    )
+    # Tamper with the intermediate: signature no longer verifies.
+    bad_intermediate = good_intermediate[:-1] + bytes(
+        [good_intermediate[-1] ^ 1]
+    )
+
+    attestation, client_data_hash, _ = _make_packed_attestation(
+        int_key, int_subject, intermediates=[bad_intermediate]
+    )
+    mds = MdsAttestationVerifier(
+        _make_blob([_make_entry([first_root, second_root])])
+    )
+    assert mds.find_entry(attestation, client_data_hash) is None
+    with pytest.raises(UntrustedAttestation):
+        mds.verify_attestation(attestation, client_data_hash)
+
+    # Same leaf/key, but a valid intermediate verifies against second_root.
+    good_attestation, good_hash, _ = _make_packed_attestation(
+        int_key, int_subject, intermediates=[good_intermediate]
+    )
+    mds = MdsAttestationVerifier(
+        _make_blob([_make_entry([first_root, second_root])])
+    )
+    entry = mds.find_entry(good_attestation, good_hash)
+    assert entry is not None
+
+
+def test_self_signed_input_cert_not_automatically_trusted():
+    """A self-signed cert in the input chain is not a trust root on its own."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    leaf_subject = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "SE"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Test Org"),
+            x509.NameAttribute(
+                NameOID.ORGANIZATIONAL_UNIT_NAME, "Authenticator Attestation"
+            ),
+            x509.NameAttribute(NameOID.COMMON_NAME, "Self Attested"),
+        ]
+    )
+    self_signed = _sign_cert(
+        key.public_key(), leaf_subject, key, leaf_subject
+    )
+
+    credential_data = AttestedCredentialData.create(
+        TEST_AAGUID,
+        b"credential-id",
+        ES256.from_cryptography_key(key.public_key()),
+    )
+    auth_data = AuthenticatorData.create(
+        b"\x00" * 32,
+        AuthenticatorData.FLAG.UP | AuthenticatorData.FLAG.AT,
+        0,
+        credential_data,
+    )
+    client_data_hash = b"\x01" * 32
+    sig = key.sign(auth_data + client_data_hash, ec.ECDSA(hashes.SHA256()))
+    attestation = AttestationObject.create(
+        "packed",
+        auth_data,
+        {"alg": -7, "sig": sig, "x5c": [self_signed]},
+    )
+
+    # The MDS entry does not list the self-signed cert, only a foreign root.
+    _, foreign_root = _make_root()
+    mds = MdsAttestationVerifier(_make_blob([_make_entry([foreign_root])]))
+    assert mds.find_entry(attestation, client_data_hash) is None
+    with pytest.raises(UntrustedAttestation):
+        mds.verify_attestation(attestation, client_data_hash)
+
+    # If the self-signed cert is explicitly listed as a trusted MDS root it
+    # works, because trust comes from the MDS entry, not from self-signing.
+    trusted = MdsAttestationVerifier(
+        _make_blob([_make_entry([self_signed])])
+    )
+    assert trusted.find_entry(attestation, client_data_hash) is not None
+
+
+def test_revoked_entry_is_filtered():
+    """Entries carrying a REVOKED status report never match."""
+    key, root = _make_root()
+    attestation, client_data_hash, _ = _make_packed_attestation(key, CA_NAME)
+    entry = _make_entry(
+        [root],
+        status_reports=[
+            StatusReport(AuthenticatorStatus.REVOKED, date(2026, 1, 1))
+        ],
+    )
+    mds = MdsAttestationVerifier(_make_blob([entry]))
+    assert mds.find_entry(attestation, client_data_hash) is None
+    with pytest.raises(UntrustedAttestation):
+        mds.verify_attestation(attestation, client_data_hash)
+
+
+def test_attestation_key_compromise_filter_still_applies():
+    """A compromised attestation certificate fails verification."""
+    key, root = _make_root()
+    attestation, client_data_hash, leaf = _make_packed_attestation(
+        key, CA_NAME
+    )
+    entry = _make_entry(
+        [root],
+        status_reports=[
+            StatusReport(AuthenticatorStatus.FIDO_CERTIFIED, date(2026, 1, 1)),
+            StatusReport(
+                AuthenticatorStatus.ATTESTATION_KEY_COMPROMISE,
+                date(2026, 1, 2),
+                certificate=leaf,
+            ),
+        ],
+    )
+    mds = MdsAttestationVerifier(_make_blob([entry]))
+    assert mds.find_entry(attestation, client_data_hash) is None
+    with pytest.raises(UntrustedAttestation):
+        mds.verify_attestation(attestation, client_data_hash)
+
+
+def test_failed_attempt_leaves_no_sticky_entry():
+    """A failed lookup must not poison the result of a subsequent lookup."""
+    good_key, good_root = _make_root()
+    good_attestation, good_hash, _ = _make_packed_attestation(
+        good_key, CA_NAME
+    )
+
+    bad_key, bad_root = _make_root()
+    bad_attestation, bad_hash, _ = _make_packed_attestation(
+        bad_key, CA_NAME
+    )
+
+    mds = MdsAttestationVerifier(_make_blob([_make_entry([good_root])]))
+
+    # Failing lookup first: bad attestation cannot be anchored to good_root.
+    assert mds.find_entry(bad_attestation, bad_hash) is None
+    # The next, valid lookup must still succeed and return the correct entry.
+    entry = mds.find_entry(good_attestation, good_hash)
+    assert entry is not None and entry.aaguid == TEST_AAGUID
+
+
+def test_custom_ca_lookup_subclass_path_preserved():
+    """Subclasses overriding ca_lookup keep working via the base class flow."""
+    key, root = _make_root()
+    attestation, client_data_hash, _ = _make_packed_attestation(key, CA_NAME)
+    blob = _make_blob([_make_entry([root])])
+
+    class FixedRootVerifier(MdsAttestationVerifier):
+        def ca_lookup(self, attestation_result, auth_data):
+            return root
+
+    verifier = FixedRootVerifier(blob)
+    verifier.verify_attestation(attestation, client_data_hash)  # no exception
