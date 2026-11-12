@@ -29,11 +29,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from base64 import b64decode, b64encode
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date
-from enum import unique
+from enum import Enum, unique
 from typing import Any, Callable, Mapping, Sequence
 
 from cryptography import x509
@@ -46,7 +48,7 @@ from .attestation import (
     verify_x509_chain,
 )
 from .cose import CoseKey
-from .utils import _JsonDataObject, websafe_decode
+from .utils import _JsonDataObject, sha256, websafe_decode
 from .webauthn import Aaguid, AttestationObject, _StringEnum
 
 logger = logging.getLogger(__name__)
@@ -529,3 +531,284 @@ def parse_blob(blob: bytes, trust_root: bytes | None) -> MetadataBlobPayload:
         )
 
     return MetadataBlobPayload.from_dict(payload)
+
+
+class MdsStoreError(Exception):
+    """Base class for errors raised by a LocalMdsStore."""
+
+
+class InvalidBlob(MdsStoreError):
+    """The blob could not be parsed or authenticated against the trust root."""
+
+
+class StaleBlob(MdsStoreError):
+    """The blob sequence number is lower than the one currently stored."""
+
+    def __init__(self, incoming_no: int, current_no: int):
+        super().__init__(
+            f"Blob no {incoming_no} is older than the current no {current_no}"
+        )
+        self.incoming_no = incoming_no
+        self.current_no = current_no
+
+
+class BlobConflict(MdsStoreError):
+    """A blob with the same sequence number but different content was given."""
+
+    def __init__(self, no: int):
+        super().__init__(f"Conflicting content for blob no {no}")
+        self.no = no
+
+
+class CorruptState(MdsStoreError):
+    """The persisted state can not be read or authenticated."""
+
+
+class MetadataNotCurrent(MdsStoreError):
+    """No current blob is available for admitting new devices."""
+
+
+@unique
+class MdsStatus(Enum):
+    """Readiness of the metadata held by a LocalMdsStore.
+
+    EMPTY: No blob has ever been imported.
+    CURRENT: The imported blob has not passed its nextUpdate date and may be used
+        to admit new devices.
+    EXPIRED: The imported blob has passed its nextUpdate date. Its entries may
+        still be queried for already known devices, but it must not be used to
+        admit new devices.
+    """
+
+    EMPTY = "empty"
+    CURRENT = "current"
+    EXPIRED = "expired"
+
+
+@unique
+class UpdateOutcome(Enum):
+    """Result of an attempted blob update."""
+
+    APPLIED = "applied"
+    UNCHANGED = "unchanged"
+
+
+class LocalMdsStore:
+    """A locally persisted store of trusted FIDO MDS3 blobs.
+
+    The store takes care of the parts that parse_blob leaves to the caller:
+    deciding whether an incoming blob is newer than what is already held,
+    rejecting replays and rollbacks, tracking the nextUpdate date against an
+    explicit clock, and persisting the authenticated blob together with its
+    sequence number as a single consistent state.
+
+    Only blobs whose signature and certificate chain validate against the
+    configured trust root can advance the sequence number. The trust root is
+    supplied by the caller at construction time and is never taken from the blob
+    itself: data inside a blob can never declare its own trust anchor.
+
+    Sequence number rules:
+
+    * A higher sequence number replaces the current state.
+    * The same sequence number with identical content is a no-op (idempotent
+      re-import), and the same sequence number with different content is
+      rejected.
+    * A lower sequence number can never overwrite the current state.
+
+    Any failed update leaves the previously stored state untouched. The state is
+    written to disk atomically, so an interrupted write, a corrupted file or a
+    restart never results in a partially applied update.
+
+    :param path: File used to persist the authenticated state.
+    :param trust_root: The DER encoded root certificate trusted to sign blobs.
+    :param clock: A zero-argument callable returning the current date, used to
+        evaluate nextUpdate. Defaults to date.today.
+    :param entry_filter: Optional filter passed to the MdsAttestationVerifier.
+    :param attestation_filter: Optional filter passed to the MdsAttestationVerifier.
+    :param attestation_types: Optional attestation types for the verifier.
+    """
+
+    def __init__(
+        self,
+        path: str | os.PathLike,
+        trust_root: bytes,
+        clock: Callable[[], date] = date.today,
+        entry_filter: EntryFilter | None = filter_revoked,
+        attestation_filter: LookupFilter | None = filter_attestation_key_compromised,
+        attestation_types: Sequence[Attestation] | None = None,
+    ):
+        if not isinstance(trust_root, (bytes, bytearray)):
+            raise TypeError("trust_root must be a DER encoded certificate (bytes)")
+        self._path = os.fspath(path)
+        self._trust_root = bytes(trust_root)
+        self._clock = clock
+        self._entry_filter = entry_filter
+        self._attestation_filter = attestation_filter
+        self._attestation_types = attestation_types
+
+        self._blob: bytes | None = None
+        self._payload: MetadataBlobPayload | None = None
+        self._verifier: MdsAttestationVerifier | None = None
+        self._load()
+
+    @property
+    def status(self) -> MdsStatus:
+        """The current readiness of the store, usable directly for policy checks."""
+        if self._payload is None:
+            return MdsStatus.EMPTY
+        if self._clock() > self._payload.next_update:
+            return MdsStatus.EXPIRED
+        return MdsStatus.CURRENT
+
+    def is_current(self) -> bool:
+        """True if the held blob may be used to admit new devices."""
+        return self.status is MdsStatus.CURRENT
+
+    @property
+    def sequence_number(self) -> int | None:
+        """The sequence number (no) of the stored blob, or None if empty."""
+        return self._payload.no if self._payload is not None else None
+
+    @property
+    def next_update(self) -> date | None:
+        """The nextUpdate date of the stored blob, or None if empty."""
+        return self._payload.next_update if self._payload is not None else None
+
+    @property
+    def payload(self) -> MetadataBlobPayload | None:
+        """The parsed payload, regardless of expiry, or None if empty."""
+        return self._payload
+
+    @property
+    def verifier(self) -> MdsAttestationVerifier:
+        """A verifier over the stored entries, valid for new device admission.
+
+        The verifier is only handed out while the blob is CURRENT. An empty or
+        expired store raises MetadataNotCurrent, so callers cannot accidentally
+        admit a new device against stale metadata. Expired entries remain
+        available through find_entry_by_aaguid/find_entry_by_chain for already
+        known devices.
+        """
+        if self._verifier is None or not self.is_current():
+            raise MetadataNotCurrent(self.status.value)
+        return self._verifier
+
+    def find_entry_by_aaguid(
+        self, aaguid: Aaguid
+    ) -> MetadataBlobPayloadEntry | None:
+        """Look up an entry by AAGUID.
+
+        Works for both current and expired blobs, to allow querying devices that
+        were already known before the metadata passed its nextUpdate date.
+        """
+        if self._verifier is None:
+            return None
+        return self._verifier.find_entry_by_aaguid(aaguid)
+
+    def find_entry_by_chain(
+        self, certificate_chain: Sequence[bytes]
+    ) -> MetadataBlobPayloadEntry | None:
+        """Look up an entry by certificate chain.
+
+        Works for both current and expired blobs, to allow querying devices that
+        were already known before the metadata passed its nextUpdate date.
+        """
+        if self._verifier is None:
+            return None
+        return self._verifier.find_entry_by_chain(certificate_chain)
+
+    def update(self, blob: bytes) -> UpdateOutcome:
+        """Authenticate and import a blob, enforcing sequence number ordering.
+
+        Returns UpdateOutcome.APPLIED if a newer blob was stored, or
+        UpdateOutcome.UNCHANGED if the identical blob was already stored. Raises
+        an MdsStoreError subclass on any rejection, without changing the stored
+        state.
+        """
+        try:
+            payload = parse_blob(blob, self._trust_root)
+        except Exception as e:
+            raise InvalidBlob(str(e)) from e
+
+        if self._payload is not None:
+            if payload.no < self._payload.no:
+                raise StaleBlob(payload.no, self._payload.no)
+            if payload.no == self._payload.no:
+                if blob == self._blob:
+                    return UpdateOutcome.UNCHANGED
+                raise BlobConflict(payload.no)
+
+        verifier = MdsAttestationVerifier(
+            payload,
+            self._entry_filter,
+            self._attestation_filter,
+            self._attestation_types,
+        )
+        self._persist(blob, payload.no)
+        self._blob = blob
+        self._payload = payload
+        self._verifier = verifier
+        logger.info("Stored MDS blob no %d", payload.no)
+        return UpdateOutcome.APPLIED
+
+    def _load(self) -> None:
+        try:
+            with open(self._path, "rb") as f:
+                state = json.loads(f.read())
+            blob = b64decode(state["blob"])
+            no = state["no"]
+            digest = b64decode(state["sha256"])
+        except FileNotFoundError:
+            return
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
+            raise CorruptState(f"Unreadable state file: {e}") from e
+
+        if sha256(blob) != digest:
+            raise CorruptState("State file failed integrity check")
+
+        try:
+            payload = parse_blob(blob, self._trust_root)
+        except Exception as e:
+            raise CorruptState(f"Stored blob can not be authenticated: {e}") from e
+
+        if payload.no != no:
+            raise CorruptState("Stored sequence number does not match blob")
+
+        self._blob = blob
+        self._payload = payload
+        self._verifier = MdsAttestationVerifier(
+            payload,
+            self._entry_filter,
+            self._attestation_filter,
+            self._attestation_types,
+        )
+
+    def _persist(self, blob: bytes, no: int) -> None:
+        directory = os.path.dirname(os.path.abspath(self._path))
+        os.makedirs(directory, exist_ok=True)
+        state = {
+            "version": 1,
+            "no": no,
+            "sha256": b64encode(sha256(blob)).decode("ascii"),
+            "blob": b64encode(blob).decode("ascii"),
+        }
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".mds3-", suffix=".tmp", dir=directory
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, self._path)
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise

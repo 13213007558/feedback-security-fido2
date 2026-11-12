@@ -3,6 +3,9 @@
     supporting additional signature algorithms while retaining the legacy fallback.
  ** MDS: Allow omitted userVerificationDetails and attachmentHint fields, as
     specified in Metadata Statement 3.1.1.
+ ** MDS: Add LocalMdsStore for managing trusted blob versions and lookup
+    indexes, with sequence number replay/rollback protection, explicit
+    nextUpdate expiry handling and atomic, restart-safe persistence.
 
 * Version 2.2.1 (released 2026-06-29)
  ** Server example: Migrate build tool from poetry to uv.
