@@ -29,12 +29,19 @@ from __future__ import annotations
 
 import logging
 import os
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
 from cryptography.exceptions import InvalidSignature as _InvalidSignature
 from cryptography.hazmat.primitives import constant_time
 
 from .cose import CoseKey
+from .extension_policy import (
+    RegistrationExtensionEvidence,
+    RegistrationExtensionPolicy,
+    _freeze_mapping,
+    evaluate_registration_extension_policy,
+)
 from .rpid import verify_rp_id
 from .utils import websafe_decode, websafe_encode
 from .webauthn import (
@@ -132,6 +139,11 @@ class Fido2Server:
         invoked with attestation_object and client_data_hash. It should return nothing
         and raise an exception on failure. By default, attestation is ignored.
         Attestation is also ignored if `attestation` is set to `none`.
+    :param extension_policy: (optional) Admission policy evaluated after the
+        challenge, origin and attestation checks of `register_complete`. The
+        policy receives the attested extension map from the signed
+        authenticator data separately from the client self-reported
+        clientExtensionResults.
     """
 
     def __init__(
@@ -140,6 +152,7 @@ class Fido2Server:
         attestation: AttestationConveyancePreference | None = None,
         verify_origin: VerifyOrigin | None = None,
         verify_attestation: VerifyAttestation | None = None,
+        extension_policy: RegistrationExtensionPolicy | None = None,
     ):
         self.rp = PublicKeyCredentialRpEntity.from_dict(rp)
         assert self.rp.id is not None  # noqa: S101
@@ -153,6 +166,7 @@ class Fido2Server:
             for alg in CoseKey.supported_algorithms()
         ]
         self._verify_attestation = verify_attestation or _ignore_attestation
+        self._extension_policy = extension_policy
         logger.debug(f"Fido2Server initialized for RP: {self.rp}")
 
     def register_begin(
@@ -166,6 +180,7 @@ class Fido2Server:
         authenticator_attachment: AuthenticatorAttachment | None = None,
         challenge: bytes | None = None,
         extensions=None,
+        extension_policy: RegistrationExtensionPolicy | None = None,
     ) -> tuple[CredentialCreationOptions, Any]:
         """Return a PublicKeyCredentialCreationOptions registration object and
         the internal state dictionary that needs to be passed as is to the
@@ -180,6 +195,10 @@ class Fido2Server:
             or None to not provide a preference (and get both types).
         :param challenge: A custom challenge to sign and verify or None to use
             OS-specific random bytes.
+        :param extensions: Extensions to request in the creation options.
+        :param extension_policy: (optional) Per-registration admission policy,
+            overriding any policy configured on the server. The requested
+            extensions and the policy are recorded in the returned state.
         :return: Registration data, internal state."""
         if not self.allowed_algorithms:
             raise ValueError("Server has no allowed algorithms.")
@@ -187,6 +206,11 @@ class Fido2Server:
         challenge = _validata_challenge(challenge)
         descriptors = _wrap_credentials(credentials)
         state = self._make_internal_state(challenge, user_verification)
+        # Snapshot the requested extensions and the policy for this exact
+        # registration. The caller's mappings are copied so later mutation of
+        # the request configuration cannot affect policy evaluation.
+        state["extensions"] = dict(extensions or {})
+        state["extension_policy"] = extension_policy or self._extension_policy
         logger.debug(
             "Starting new registration, existing credentials: "
             + ", ".join(d.id.hex() for d in descriptors or [])
@@ -271,6 +295,28 @@ class Fido2Server:
 
         auth_data = attestation_object.auth_data
         assert auth_data.credential_data is not None  # noqa: S101
+
+        # Extension admission runs only after the challenge, origin and
+        # attestation checks above have validated the signed authenticator
+        # data. The attested extension map and the client self-reported
+        # extensions are handed to the policy as distinct read-only evidence.
+        policy = state.get("extension_policy")
+        if policy is not None:
+            evidence = RegistrationExtensionEvidence(
+                requested_extensions=MappingProxyType(
+                    dict(state.get("extensions") or {})
+                ),
+                authenticator_extensions=(
+                    _freeze_mapping(auth_data.extensions)
+                    if auth_data.extensions is not None
+                    else MappingProxyType({})
+                ),
+                client_extensions=MappingProxyType(
+                    registration.client_extension_results
+                ),
+            )
+            evaluate_registration_extension_policy(policy, evidence)
+
         logger.info(
             "New credential registered: "
             + auth_data.credential_data.credential_id.hex()

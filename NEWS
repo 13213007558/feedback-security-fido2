@@ -1,4 +1,9 @@
 * Version 2.2.2 (unreleased)
+ ** Server: Add registration extension admission policies, enabling server-side
+    enforcement of attested authenticator extension data (e.g. a minimum
+    credProtect level) via Fido2Server's extension_policy.
+ ** WebAuthn: Reject authenticator data whose extension data flag, CBOR map
+    boundary or trailing bytes are inconsistent.
  ** Attestation: Use cryptography's certificate issuer verification when available,
     supporting additional signature algorithms while retaining the legacy fallback.
  ** MDS: Allow omitted userVerificationDetails and attachmentHint fields, as

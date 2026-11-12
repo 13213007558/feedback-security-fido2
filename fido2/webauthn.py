@@ -222,6 +222,11 @@ class AuthenticatorData(bytes):
 
         if self.flags & AuthenticatorData.FLAG.ED:
             extensions, rest = cbor.decode_from(rest)
+            # The extension data must be a CBOR map, and the map must consume
+            # all remaining bytes so that the ED flag, the CBOR boundary and
+            # the trailing data all agree.
+            if not isinstance(extensions, Mapping) or rest:
+                raise ValueError("Invalid extension data in AuthenticatorData.")
         else:
             extensions = None
         object.__setattr__(self, "extensions", extensions)
